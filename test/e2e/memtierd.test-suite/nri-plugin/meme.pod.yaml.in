@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${NAME}
+  labels:
+    app: ${NAME}
+  $([ -n "${!ANN*}" ] && echo "
+  annotations:
+    $(for ann in ${!ANN*}; do [[ "$ann" == ANN[0-9]* ]] && echo "
+    ${!ann}
+    "; done)
+  ")
+spec:
+  containers:
+  $(for contnum in $(seq 1 ${CONTCOUNT}); do echo "
+  - name: memectr$(( contnum - 1 ))
+    image: meme:latest
+    imagePullPolicy: Never
+    command:
+      - /usr/local/bin/meme
+      - -bs=${BS}
+      - -brc=0
+      - -bwc=${BWC}
+      - -bws=${BWS}
+      - -bwo=${BWO}
+      - -bwod=${BWOD}
+      - -bwi=${BWI}
+      - -ttl=12h
+  "; done )
+  terminationGracePeriodSeconds: 1

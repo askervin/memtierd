@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: memtierd-nri
+  namespace: kube-system
+  labels:
+    app: memtierd-nri
+spec:
+  selector:
+    matchLabels:
+      name: memtierd-nri
+  template:
+    metadata:
+      labels:
+        name: memtierd-nri
+    spec:
+      hostPID: true
+      containers:
+        - name: pod-memtierd
+          args:
+            - --host-root
+            - /host
+          image: memtierd-nri:latest
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: nri-socket
+              mountPath: /var/run/nri/nri.sock
+            - name: host-volume
+              mountPath: /host
+            - name: host-bitmap
+              mountPath: /sys/kernel/mm/page_idle/bitmap
+      volumes:
+        - name: nri-socket
+          hostPath:
+            path: /var/run/nri/nri.sock
+        - name: host-volume
+          hostPath:
+            path: /
+        - name: host-bitmap
+          hostPath:
+            path: /sys/kernel/mm/page_idle/bitmap
