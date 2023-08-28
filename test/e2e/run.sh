@@ -911,6 +911,7 @@ create() { # script API
     local template_kind
     template_kind=$(awk '/kind/{print tolower($2)}' < "$template_file")
     local wait=${wait-Ready}
+    local wait_for
     local wait_t=${wait_t-240s}
     local images
     local image
@@ -987,7 +988,12 @@ create() { # script API
             fi
         }
         if [[ "$wait" != "" ]]; then
-            speed=1000 vm-command "kubectl wait --timeout=${wait_t} --for=condition=${wait} $namespace_args ${template_kind}/$NAME" >/dev/null 2>&1 || {
+            if [[ "$wait" == *"="* ]]; then
+                wait_for="$wait"
+            else
+                wait_for="condition=$wait"
+            fi
+            speed=1000 vm-command "kubectl wait --timeout=${wait_t} --for=${wait_for} $namespace_args ${template_kind}/$NAME" >/dev/null 2>&1 || {
                 errormsg="waiting for ${template_kind} \"$NAME\" to become ready timed out"
                 if is-hooked on_create_fail; then
                     echo "$errormsg"
