@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Cmd represents a command with a description and a function to execute.
@@ -41,7 +42,7 @@ type Cmd struct {
 // Prompt represents an interactive prompt with associated functionality.
 type Prompt struct {
 	r            *bufio.Reader
-	w            *bufio.Writer
+	w            bufWriter
 	f            *flag.FlagSet
 	pidwatcher   PidWatcher
 	mover        *Mover
@@ -94,6 +95,7 @@ func NewPrompt(ps1 string, reader *bufio.Reader, writer *bufio.Writer) *Prompt {
 		"routines":   {"manage routines.", p.cmdRoutines},
 		"time":       {"print timestamps or elapsed time.", p.cmdTime},
 		"help":       {"print help.", p.cmdHelp},
+		"log":        {"log a message or all output", p.cmdLog},
 		"nop":        {"no operation.", p.cmdNop},
 	}
 	return &p
@@ -107,6 +109,43 @@ func (p *Prompt) output(format string, a ...interface{}) {
 	}
 	_, _ = p.w.WriteString(fmt.Sprintf(format, a...))
 	p.w.Flush()
+}
+
+// bufWriter interface is a small subset of bufio.Writer
+// that implements io.Writer, too.
+type bufWriter interface {
+	Write(p []byte) (nn int, err error)
+	WriteString(s string) (int, error)
+	Flush() error
+}
+
+type logWriter struct {
+	prefix  string
+	orig    bufWriter
+	logCopy bool
+}
+
+func (lw *logWriter) Write(p []byte) (int, error) {
+	log.Infof("%s%s", lw.prefix, string(p))
+	if lw.logCopy {
+		return lw.orig.Write(p)
+	}
+	return len(p), nil
+}
+
+func (lw *logWriter) WriteString(s string) (int, error) {
+	log.Infof("%s%s", lw.prefix, s)
+	if lw.logCopy {
+		return lw.orig.WriteString(s)
+	}
+	return len(s), nil
+}
+
+func (lw *logWriter) Flush() error {
+	if lw.logCopy {
+		return lw.orig.Flush()
+	}
+	return nil
 }
 
 // RunCmdSlice executes a command specified by a slice of strings.
@@ -129,6 +168,63 @@ func (p *Prompt) RunCmdSlice(cmdSlice []string) CommandStatus {
 	return cmd.Run(cmdSlice[1:])
 }
 
+// cmdStringToSlice enables quoting parameters that contain spaces
+// with single and double quotes and escaping.
+func cmdStringToSlice(raw string) ([]string, error) {
+	var args []string
+	var currentArg string
+	var quoteStart rune
+	var quoteEnd rune
+	startEnd := map[rune]rune{
+		'"':  '"',
+		'\'': '\'',
+	}
+	escape := '\\'
+	escaped := false
+	quoted := false
+	for _, c := range raw {
+		if escaped {
+			currentArg += string(c)
+			escaped = false
+			continue
+		}
+		if c == escape {
+			escaped = true
+			continue
+		}
+		if !quoted {
+			if unicode.IsSpace(c) {
+				if currentArg != "" {
+					args = append(args, currentArg)
+				}
+				currentArg = ""
+				continue
+			}
+			if quoteEnd, quoted = startEnd[c]; quoted {
+				quoteStart = c
+				continue
+			}
+			currentArg += string(c)
+		} else {
+			if c == quoteEnd {
+				quoted = false
+				continue
+			}
+			currentArg += string(c)
+		}
+	}
+	if escaped {
+		return args, fmt.Errorf("missing escaped character")
+	}
+	if quoted {
+		return args, fmt.Errorf("unterminated quoted (%c) string", quoteStart)
+	}
+	if currentArg != "" {
+		args = append(args, currentArg)
+	}
+	return args, nil
+}
+
 // RunCmdString executes a command specified by a string.
 func (p *Prompt) RunCmdString(cmdString string) CommandStatus {
 	p.mutex.Lock()
@@ -144,8 +240,11 @@ func (p *Prompt) RunCmdString(cmdString string) CommandStatus {
 		pipeCmd = cmdString[pipeIndex+1:]
 		cmdString = cmdString[:pipeIndex]
 	}
-	// TODO: consider shlex-like splitting.
-	cmdSlice := strings.Split(strings.TrimSpace(cmdString), " ")
+	cmdSlice, err := cmdStringToSlice(strings.TrimSpace(cmdString))
+	if err != nil {
+		p.output("error in command %q: %s", cmdString, err)
+		return csError
+	}
 
 	// If there is a pipe, redirect p.output() (that is, p.w) to
 	// the pipe before calling cmd<Function>.
@@ -203,6 +302,11 @@ func (p *Prompt) SetEcho(newEcho bool) {
 	p.echo = newEcho
 }
 
+// SetInput changes the reader from which interactive prompt reads input.
+func (p *Prompt) SetInput(reader *bufio.Reader) {
+	p.r = reader
+}
+
 // SetPolicy sets the policy for the prompt.
 func (p *Prompt) SetPolicy(policy Policy) {
 	p.policy = policy
@@ -239,6 +343,54 @@ func sortedNodeKeys(m map[Node]uint) []Node {
 }
 
 func (p *Prompt) cmdNop(args []string) CommandStatus {
+	return csOk
+}
+
+func (p *Prompt) cmdLog(args []string) CommandStatus {
+	optInfo := p.f.String("i", "", "-i MSG log an info message")
+	optDebug := p.f.String("d", "", "-d MSG log a debug message")
+	optError := p.f.String("e", "", "-e MSG log an error message")
+	optFatal := p.f.String("f", "", "-f MSG log a fatal error message and exit")
+	optCopy := p.f.Bool("copy", false, "copy all prompt output to log")
+	optCapture := p.f.Bool("capture", false, "redirect all prompt output to log")
+	optPrefix := p.f.String("prefix", "<undefined>", "add PREFIX to prompt output written to log")
+	if err := p.f.Parse(args); err != nil {
+		return csOk
+	}
+	if *optInfo != "" {
+		log.Infof(*optInfo)
+	}
+	if *optDebug != "" {
+		log.Debugf(*optDebug)
+	}
+	if *optError != "" {
+		log.Errorf(*optError)
+	}
+	if *optFatal != "" {
+		log.Fatalf(*optFatal)
+	}
+	if *optCopy || *optCapture {
+		p.outputMutex.Lock()
+		if lw, ok := p.w.(*logWriter); ok {
+			lw.logCopy = *optCopy
+		} else {
+			p.w = &logWriter{
+				logCopy: *optCopy,
+				orig:    p.w,
+			}
+		}
+		p.outputMutex.Unlock()
+	}
+	if *optPrefix != "<undefined>" {
+		p.outputMutex.Lock()
+		if lw, ok := p.w.(*logWriter); ok {
+			lw.prefix = *optPrefix
+			p.outputMutex.Unlock()
+		} else {
+			p.outputMutex.Unlock()
+			p.output("cannot set prefix, output is not copied or captured into log\n")
+		}
+	}
 	return csOk
 }
 
