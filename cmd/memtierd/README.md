@@ -276,15 +276,23 @@ ssh debian@172.17.0.2 "sudo mv meme /usr/local/bin"
 
 ## Policies
 
-Memtierd implements two policies: age and heat. These policies have
-different ways of interpreting memory tracker counters as page
-activity.
+Memtierd implements three policies: age, heat, and ratio. Age and heat
+policies move or swap out memory based on last access times (age) or
+memory activity class (heat class). The ratio policy moves or swaps
+out a fixed ratio of least recently used memory.
 
-Policies measure and manage the memory of processes that are defined
-in the configuration. Processes are searched by pidwatchers. The
-cgroups pidwatcher looks for processes under listed a list of cgroups
-directories, while the pidlist pidwatcher passes a static list of pids
-to policies. See
+## Watchers
+
+Policies track and manage the memory of processes of
+interest. Processes are found and filtered by pidwatchers. The cgroups
+pidwatcher looks for processes under listed cgroups directories. The
+proc pidwatcher finds all running processes in the system. The pidlist
+pidwatcher finds only the static list of pids. The filter pidwatcher
+filters interesting processes out of all processes found by other
+pidwatchers.
+
+For examples of configuring pidwatchers, see:
+
 [memtierd-age-idlepage-trackonly.yaml](../../sample-configs/memtierd-age-idlepage-trackonly.yaml).
 
 ### The age policy
@@ -309,7 +317,7 @@ activity on every scan in the past 10 seconds. In both cases pages are
 moved.
 
 ```
-memtierd> policy -create age -config {"Tracker":{"Name":"softdirty","Config":"{\"PagesInRegion\":256,\"MaxCountPerRegion\":1,\"ScanIntervalMs\":4000,\"RegionsUpdateMs\":0,\"SkipPageProb\":0,\"PagemapReadahead\":0}"},"Mover":{"IntervalMs":20,"Bandwidth":200},"Cgroups":["/sys/fs/cgroup/foobar"],"IntervalMs":5000,"IdleDurationMs":15000,"IdleNumas":[2,3],"ActiveDurationMs":10000,"ActiveNumas":[0,1]} -start
+memtierd> policy -create age -config '{"Tracker":{"Name":"softdirty","Config":"{\"PagesInRegion\":256,\"MaxCountPerRegion\":1,\"ScanIntervalMs\":4000},"Mover":{"IntervalMs":20,"Bandwidth":200},"Cgroups":["/sys/fs/cgroup/foobar"],"IntervalMs":5000,"IdleDurationMs":15000,"IdleNumas":[2,3],"ActiveDurationMs":10000,"ActiveNumas":[0,1]}' -start
 ```
 
 The age policy works with idlepage and softdirty trackers, but not
@@ -336,7 +344,7 @@ hottest pages (class 3) to nodes 0 or 1, and coldest pages (class 0)
 to 2 or 3, and leave intermediate pages unmoved.
 
 ```
-memtierd> policy -create heat -config {"Tracker":{"Name":"idlepage","Config":"{\"PagesInRegion\":256,\"MaxCountPerRegion\":0,\"ScanIntervalMs\":5000,\"RegionsUpdateMs\":0,\"PagemapReadahead\":0,\"KpageflagsReadahead\":0,\"BitmapReadahead\":0}"},"Heatmap":{"HeatMax":0.01,"HeatRetention":0.8,"HeatClasses":4},"Mover":{"IntervalMs":20,"Bandwidth":200},"Cgroups":["/sys/fs/cgroup/foobar"],"IntervalMs":10000,"HeatNumas":{"0":[2,3],"3":[0,1]}}
+memtierd> policy -create heat -config '{"Tracker":{"Name":"idlepage","Config":"{\"PagesInRegion\":256,\"MaxCountPerRegion\":0,\"ScanIntervalMs\":5000}},"Heatmap":{"HeatMax":0.01,"HeatRetention":0.8,"HeatClasses":4},"Mover":{"IntervalMs":20,"Bandwidth":200},"Cgroups":["/sys/fs/cgroup/foobar"],"IntervalMs":10000,"HeatNumas":{"0":[2,3],"3":[0,1]}}'
 ```
 
 The heat policy works with all trackers.
