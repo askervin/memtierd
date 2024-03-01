@@ -30,13 +30,13 @@ type PidWatcherFilterConfig struct {
 
 // PidFilterConfig holds the configuration for a PidWatcherFilter filter.
 type PidFilterConfig struct {
-	Exclude               bool
 	ProcExeRegexp         string
 	MinVmSizeKb           int
 	MinVmRSSKb            int
 	MinPrivateDirtyKb     int
 	And                   []*PidFilterConfig
 	Or                    []*PidFilterConfig
+	Not                   *PidFilterConfig
 	compiledProcExeRegexp *regexp.Regexp
 }
 
@@ -81,12 +81,8 @@ func (w *PidWatcherFilter) SetConfigJSON(configJSON string) error {
 	}
 	// Validate filters.
 	for _, fc := range config.Filters {
-		if fc.ProcExeRegexp != "" {
-			re, err := regexp.Compile(fc.ProcExeRegexp)
-			if err != nil {
-				return fmt.Errorf("pidwatcher filter: invalid ProcExeRegexp: %q: %w", fc.ProcExeRegexp, err)
-			}
-			fc.compiledProcExeRegexp = re
+		if err := prepareFilter(fc); err != nil {
+			return fmt.Errorf("invalid filter: %s", err)
 		}
 	}
 	w.source = newSource
@@ -124,10 +120,11 @@ func (w *PidWatcherFilter) SetPidListener(l PidListener) {
 // Poll is a method of PidWatcherFilter that triggers the polling process of the source PidWatcher.
 func (w *PidWatcherFilter) Poll() error {
 	w.mutex.Lock()
-	defer w.mutex.Unlock()
 	if w.source == nil {
+		w.mutex.Unlock()
 		return fmt.Errorf("pidwatcher filter: poll: missing pid source")
 	}
+	w.mutex.Unlock()
 	return w.source.Poll()
 }
 
@@ -158,6 +155,27 @@ func (w *PidWatcherFilter) Dump([]string) string {
 	return fmt.Sprintf("%+v", w)
 }
 
+func prepareFilter(fc *PidFilterConfig) error {
+	if fc.ProcExeRegexp != "" && fc.compiledProcExeRegexp == nil {
+		re, err := regexp.Compile(fc.ProcExeRegexp)
+		if err != nil {
+			return fmt.Errorf("invalid ProcExeRegexp: %q: %w", fc.ProcExeRegexp, err)
+		}
+		fc.compiledProcExeRegexp = re
+	}
+	for _, childFc := range append(fc.And, fc.Or...) {
+		if err := prepareFilter(childFc); err != nil {
+			return err
+		}
+	}
+	if fc.Not != nil {
+		if err := prepareFilter(fc.Not); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func pidsMatchingFilter(fc *PidFilterConfig, pids []int) []int {
 	matchingPids := pids
 	if fc.compiledProcExeRegexp != nil {
@@ -178,6 +196,9 @@ func pidsMatchingFilter(fc *PidFilterConfig, pids []int) []int {
 	if len(fc.Or) > 0 {
 		matchingPids = pidsMatchingFilterOr(fc.Or, matchingPids)
 	}
+	if fc.Not != nil {
+		matchingPids = pidsMatchingFilterNot(fc.Not, matchingPids)
+	}
 	return matchingPids
 }
 
@@ -193,10 +214,10 @@ func pidsMatchingFilterAnd(fcs []*PidFilterConfig, pids []int) []int {
 }
 
 func pidsMatchingFilterOr(fcs []*PidFilterConfig, pids []int) []int {
-	pidsInOr := map[int]struct{}{}
+	pidsInOr := map[int]setMemberType{}
 	for _, fc := range fcs {
 		for _, pid := range pidsMatchingFilter(fc, pids) {
-			pidsInOr[pid] = struct{}{}
+			pidsInOr[pid] = setMember
 		}
 		if len(pidsInOr) == len(pids) {
 			// short-circuit: all pids already matched
@@ -208,6 +229,20 @@ func pidsMatchingFilterOr(fcs []*PidFilterConfig, pids []int) []int {
 		matchingPids = append(matchingPids, pid)
 	}
 	return matchingPids
+}
+
+func pidsMatchingFilterNot(fc *PidFilterConfig, pids []int) []int {
+	notPids := map[int]setMemberType{}
+	for _, pid := range pidsMatchingFilter(fc, pids) {
+		notPids[pid] = setMember
+	}
+	otherPids := make([]int, 0, len(pids) - len(notPids))
+	for _, pid := range pids {
+		if _, ok := notPids[pid]; !ok {
+			otherPids = append(otherPids, pid)
+		}
+	}
+	return otherPids
 }
 
 func pidsMatchingFilterMinVmSizeKb(fc *PidFilterConfig, pids []int) []int {
@@ -259,8 +294,7 @@ func pidsMatchingFilterProcExeRegexp(fc *PidFilterConfig, pids []int) []int {
 		if err != nil {
 			continue
 		}
-		matched := fc.compiledProcExeRegexp.MatchString(exeFilepath)
-		if (matched && !fc.Exclude) || (!matched && fc.Exclude) {
+		if fc.compiledProcExeRegexp.MatchString(exeFilepath) {
 			matchingPids = append(matchingPids, pid)
 		}
 	}
