@@ -178,6 +178,25 @@ func procReadInt(path string) (int, error) {
 	return n, nil
 }
 
+func procReadInts(path string) ([]int, error) {
+	var ints []int
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	for lineIndex, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		for fieldIndex, value := range fields {
+			n, err := strconv.Atoi(fields[fieldIndex])
+			if err != nil {
+				return nil, fmt.Errorf("%s:%d error parsing int from field %d: %q", path, lineIndex+1, fieldIndex+1, value)
+			}
+			ints = append(ints, n)
+		}
+	}
+	return ints, nil
+}
+
 func procReadIntFromLine(path string, linePrefix string, fieldIndex int) (int, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -220,6 +239,42 @@ func procReadIntSumFromLines(path string, linePrefix string, fieldIndex int) (in
 		}
 	}
 	return sum, nil
+}
+
+// procReadIntListFormat parses List Formats used in cpuset.cpus and .mems.
+// Example: "0-3,5,7-9" -> []int{0, 1, 2, 3, 5, 7, 8, 9}
+func procReadIntListFormat(path string, defaultValue []int) ([]int, error) {
+	data, err := procReadTrimmed(path)
+	if err != nil {
+		return nil, err
+	}
+        if data == "" {
+                return defaultValue, nil
+        }
+        result := []int{}
+        for _, comma := range strings.Split(data, ",") {
+                rng := strings.Split(comma, "-")
+                if len(rng) == 1 {
+                        n, err := strconv.Atoi(rng[0])
+                        if err != nil {
+                                return nil, err
+                        }
+			result = append(result, n)
+			continue
+                }
+		first, err := strconv.Atoi(rng[0])
+		if err != nil {
+			return nil, err
+		}
+		last, err := strconv.Atoi(rng[1])
+		if err != nil {
+			return nil, err
+		}
+		for n := first; n <= last; n++ {
+			result = append(result, n)
+                }
+        }
+        return result, nil
 }
 
 func ProcMemOpen(pid int) (*ProcMemFile, error) {
@@ -569,6 +624,61 @@ func pagemapBitsSatisfied(pagemapBits uint64,
 		return false
 	}
 	return true
+}
+
+// procNumaMaps helps parsing /proc/PID/numa_maps
+// [root@n4c16-fedora-containerd fedora]# grep N[123]= /proc/44598/numa_maps                           // 00400000 default file=/usr/bin/meme mapped=128 mapmax=4 active=0 N1=113 N2=15 kernelpagesize_kB=4
+// 004c6000 default file=/usr/bin/meme mapped=50 mapmax=4 active=0 N1=14 N2=36 kernelpagesize_kB=4
+// 00578000 default file=/usr/bin/meme anon=6 dirty=6 mapped=8 mapmax=4 active=0 N0=6 N2=2 kernelpagesize_kB=4
+// c000000000 default anon=179344 dirty=179344 active=0 N0=1942 N1=398 N2=916 N3=131171 N4=44917 kernelpagesize_kB=4
+// 7fc1ba507000 default anon=223 dirty=223 active=0 N0=181 N1=2 N2=30 N3=10 kernelpagesize_kB=4
+// 7fc20100e000 default anon=68 dirty=68 active=0 N0=53 N1=15 kernelpagesize_kB=4
+// 7ffec41fe000 default stack anon=4 dirty=4 active=0 N0=3 N1=1 kernelpagesize_kB=4
+func procNumaMaps(pid int, cb func (addr uint64, nodePagecount map[int]int64, pagesize int64, attrs map[string]string)) error {
+	sPid := strconv.Itoa(pid)
+	path := "/proc/" + sPid + "/numa_maps"
+	data, err := procRead(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		addr, err := strconv.ParseUint(fields[0], 16, 64)
+		if err != nil {
+			continue
+		}
+		attrs := make(map[string]string)
+		nodePagecount := make(map[int]int64)
+		pagesize := int64(0)
+		for _, field := range fields[1:] {
+			keyValue := strings.Split(field, "=")
+			if len(keyValue) == 2 && len(keyValue[0]) > 0 {
+				attrs[keyValue[0]] = keyValue[1]
+				if keyValue[0][0] == 'N' {
+					node, err := strconv.Atoi(keyValue[0][1:])
+					if err != nil {
+						continue
+					}
+					pages, err := strconv.Atoi(keyValue[1])
+					nodePagecount[node] = int64(pages)
+				}
+				if keyValue[0] == "kernelpagesize_kB" {
+					pagesizeKB, err := strconv.Atoi(keyValue[1])
+					if err != nil {
+						continue
+					}
+					pagesize = int64(pagesizeKB) * 1024
+				}
+			}
+		}
+		if len(attrs) > 0 {
+			cb(addr, nodePagecount, pagesize, attrs)
+		}
+	}
+	return nil
 }
 
 // procMaps returns address ranges of a process
