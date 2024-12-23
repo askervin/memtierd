@@ -44,6 +44,9 @@ import (
 const (
 	defaultStartFreeingMemory = "8%"
 	defaultStopFreeingMemory  = "16%"
+	// Do not bother trying to move processes that have less than this
+	// amount of memory on high pressure nodes. (Bytes)
+	constMinimumPidMoveSize = 16 * 1024 * 1024
 )
 
 type PolicyAvoidOomConfig struct {
@@ -64,27 +67,41 @@ type PolicyAvoidOomConfig struct {
 	Mover      MoverConfig
 }
 
+type NodeMask NodeMask
+
 // PolicyAvoidOom defines empty struct for the scenarios without policy configured.
 type PolicyAvoidOom struct {
-	config   *PolicyAvoidOomConfig
-	nodes    []*memNode
-	nodeSets map[uint64]*nodeset
-	cgroups  []*cgroup
-	mover    *Mover
-	cmdLoop  chan chan interface{}
-	mutex    sync.Mutex
+	config    *PolicyAvoidOomConfig
+	nodes     []*memNode
+	nodeSets  map[NodeMask]*nodeset
+	cgroups   []*cgroup
+	prevCands []*moveCandidate
+	mover     *Mover
+	cmdLoop   chan chan interface{}
+	mutex     sync.Mutex
 }
 
 type memNode struct {
 	id                 int
+	mask               NodeMask
 	memAvail           int64
 	memTotal           int64
 	startFreeingMemory int64
 	stopFreeingMemory  int64
 }
 
+type moveCandidate struct {
+	pid                  int
+	cgroup               *cgroup
+	addr                 uint64
+	size                 int64
+	fromNode             int
+	preferredTargetMasks []NodeMask
+	score                int64
+}
+
 var allNumaNodes []int
-var allNumaNodesMask uint64
+var allNumaNodesMask NodeMask
 
 func init() {
 	PolicyRegister("avoid-oom", NewPolicyAvoidOom)
@@ -99,21 +116,19 @@ func NewPolicyAvoidOom() (Policy, error) {
 		if err != nil || len(allNumaNodes) == 0 {
 			return nil, fmt.Errorf("failed to read online NUMA nodes from %q: %w", onlineNodesPath, err)
 		}
-		allNumaNodesMask = 0
-		for _, nodeId := range allNumaNodes {
-			allNumaNodesMask |= 1 << nodeId
-		}
+		allNumaNodesMask = nodeIdsToMask(allNumaNodes)
 	}
 	nodes := []*memNode{}
 	for _, nodeId := range allNumaNodes {
 		node := &memNode{
-			id: nodeId,
+			id:   nodeId,
+			mask: nodeIdToMask(nodeId),
 		}
 		nodes = append(nodes, node)
 	}
 	p := &PolicyAvoidOom{
 		nodes:    nodes,
-		nodeSets: make(map[uint64]*nodeset),
+		nodeSets: make(map[NodeMask]*nodeset),
 		mover:    NewMover(),
 	}
 	if err := p.updateNodes(); err != nil {
@@ -204,7 +219,7 @@ func (p *PolicyAvoidOom) Stop() {
 }
 
 // PidWatcher is a method of PolicyAvoidOom, returns nil.
-// As when there is no policy, pidwatcher does not make sense.
+// AvoidOoom does not have a pid watcher.
 func (p *PolicyAvoidOom) PidWatcher() PidWatcher {
 	return nil
 }
@@ -215,49 +230,34 @@ func (p *PolicyAvoidOom) Mover() *Mover {
 }
 
 // Tracker is a method of PolicyAvoidOom, returns nil.
-// As when there is no policy, tracker does not make sense.
+// AvoidOoom does not have a tracker.
 func (p *PolicyAvoidOom) Tracker() Tracker {
 	return nil
 }
 
 func (p *PolicyAvoidOom) updateCgroups() error {
-	p.nodeSets = map[uint64]*nodeset{}
+	p.nodeSets = map[NodeMask]*nodeset{}
 	p.nodeSets[allNumaNodesMask] = &nodeset{
 		nodeMask: allNumaNodesMask,
 	}
 	p.cgroups = make([]*cgroup, 0)
-	// Find all cgroups (sub)directories under user-defined cgroups
-	cgroupPaths := []string{}
-	for _, cgroupParents := range p.config.Cgroups {
-		filepath.WalkDir(cgroupParents,
-			func(path string, d fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if d.IsDir() {
-					cgroupPaths = append(cgroupPaths, path)
-				}
-				return nil
-			})
-	}
-	if len(cgroupPaths) == 0 {
+	cgroupDirs := p.scanCgroupDirs()
+	if len(cgroupDirs) == 0 {
 		return fmt.Errorf("no cgroups found")
 	}
-	for _, cgroupPath := range cgroupPaths {
+	for _, cgroupDir := range cgroupDirs {
 		// Ignore cgroups without processes
-		procs, err := procReadInts(filepath.Join(cgroupPath, "cgroup.procs"))
+		procs, err := procReadInts(filepath.Join(cgroupDir, "cgroup.procs"))
 		if err != nil || len(procs) == 0 {
 			continue
 		}
 		// Ignore cgroups without cpuset.mems
-		mems, err := procReadIntListFormat(filepath.Join(cgroupPath, "cpuset.mems.effective"), allNumaNodes)
+		mems, err := procReadIntListFormat(filepath.Join(cgroupDir, "cpuset.mems.effective"), allNumaNodes)
 		if err != nil {
 			continue
 		}
-		nodeMask := uint64(0)
-		for _, nodeId := range mems {
-			nodeMask |= 1 << nodeId
-		}
+		// Add cgroup to the policy
+		nodeMask := nodeIdsToMask(mems)
 		if nodeMask == 0 {
 			continue
 		}
@@ -269,7 +269,7 @@ func (p *PolicyAvoidOom) updateCgroups() error {
 			p.nodeSets[nodeMask] = nset
 		}
 		cgroup := &cgroup{
-			fullPath: cgroupPath,
+			fullPath: cgroupDir,
 			procs:    procs,
 			nodeset:  nset,
 		}
@@ -278,7 +278,7 @@ func (p *PolicyAvoidOom) updateCgroups() error {
 	}
 	for nodeMask, nset := range p.nodeSets {
 		for _, node := range p.nodes {
-			if nodeMask&(1<<node.id) != 0 {
+			if nodeMask&node.mask != 0 {
 				nset.memAvail += node.memAvail
 				nset.memTotal += node.memTotal
 				nset.startFreeingMemory += node.startFreeingMemory
@@ -287,6 +287,24 @@ func (p *PolicyAvoidOom) updateCgroups() error {
 		}
 	}
 	return nil
+}
+
+// scanCgroupDirs returns a list of cgroup paths under user-defined cgroups.
+func (p *PolicyAvoidOom) scanCgroupDirs() []string {
+	cgroupDirs := []string{}
+	for _, cgroupParents := range p.config.Cgroups {
+		filepath.WalkDir(cgroupParents,
+			func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if d.IsDir() {
+					cgroupDirs = append(cgroupDirs, path)
+				}
+				return nil
+			})
+	}
+	return cgroupDirs
 }
 
 func (p *PolicyAvoidOom) updateNodes() error {
@@ -300,7 +318,7 @@ func (p *PolicyAvoidOom) updateNodes() error {
 }
 
 type nodeset struct {
-	nodeMask           uint64
+	nodeMask           NodeMask
 	cgroups            []*cgroup
 	memAvail           int64
 	memTotal           int64
@@ -309,16 +327,10 @@ type nodeset struct {
 }
 
 func (nset *nodeset) NodeIds() []int {
-	nodeIds := []int{}
-	for _, nodeId := range allNumaNodes {
-		if nset.nodeMask&(1<<nodeId) != 0 {
-			nodeIds = append(nodeIds, nodeId)
-		}
-	}
-	return nodeIds
+	return nodeMaskToIds(nset.nodeMask)
 }
 
-func nodeMaskToIds(nodeMask uint64) []int {
+func nodeMaskToIds(nodeMask NodeMask) []int {
 	nodeIds := []int{}
 	for _, nodeId := range allNumaNodes {
 		if nodeMask&(1<<nodeId) != 0 {
@@ -326,6 +338,18 @@ func nodeMaskToIds(nodeMask uint64) []int {
 		}
 	}
 	return nodeIds
+}
+
+func nodeIdsToMask(nodeIds []int) NodeMask {
+	nodeMask := NodeMask(0)
+	for _, nodeId := range nodeIds {
+		nodeMask |= 1 << nodeId
+	}
+	return nodeMask
+}
+
+func nodeIdToMask(nodeId int) NodeMask {
+	return 1<<nodeId
 }
 
 type cgroup struct {
@@ -424,54 +448,24 @@ func (p *PolicyAvoidOom) balance() error {
 		log.Debugf("PolicyAvoidOom.balance: mover busy\n")
 		return nil
 	}
-	mostPressureNodesets := make([]*nodeset, 0, len(p.nodeSets))
-	for _, nset := range p.nodeSets {
-		mostPressureNodesets = append(mostPressureNodesets, nset)
-	}
-	sort.Slice(mostPressureNodesets, func(i, j int) bool {
-		return mostPressureNodesets[i].memAvail < mostPressureNodesets[j].memAvail
-	})
-	leastPressureNodesets := make([]*nodeset, 0, len(p.nodeSets))
-	for i := len(mostPressureNodesets) - 1; i >= 0; i-- {
-		leastPressureNodesets = append(leastPressureNodesets, mostPressureNodesets[i])
-	}
-	for order, nset := range mostPressureNodesets {
-		procs := []int{}
-		for _, cgroup := range nset.cgroups {
-			procs = append(procs, cgroup.procs...)
-		}
-		log.Debugf("order %d in nodes %v: avail %.3fG/%.3fG %.1f %% cgroups: %d %v\n", order, nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.memTotal)/(1<<30), 100*float32(nset.memAvail)/float32(nset.memTotal), len(nset.cgroups), procs)
-	}
-	highPressureNodeMask := uint64(0)
-	medPressureNodeMask := uint64(0)
-	for _, nset := range mostPressureNodesets {
-		if nset.memAvail < nset.startFreeingMemory {
-			log.Debugf("high pressure on nodes %v, avail: %.3fG startFreeing: %.3fG\n", nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.startFreeingMemory)/(1<<30))
-			highPressureNodeMask |= nset.nodeMask
-			// TODO: find cgroups allowed to use nodes in
-			// nset and some other nodes (with lower
-			// pressure) and how much they have data in
-			// nset according to numa_maps. Then find
-			// processes in these cgroups, sorted by
-			// oom-score, and move them away from nset.
-		} else if nset.memAvail < nset.stopFreeingMemory {
-			log.Debugf("med pressure on nodes %v, avail: %.3fG stopFreeing: %.3fG\n", nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.stopFreeingMemory)/(1<<30))
-			medPressureNodeMask |= nset.nodeMask
-		}
-	}
+	mostPressureNodesets, highPressureNodeMask, medPressureNodeMask, noPressureNodeMask := p.pressureNodesets()
 	if highPressureNodeMask == 0 {
 		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: no pressure"})
 		return nil
 	}
 	if highPressureNodeMask == allNumaNodesMask {
-		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: pressure on all nodes"})
+		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: high pressure on all nodes"})
+		return nil
+	}
+	if noPressureNodeMask == 0 {
+		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: no low pressure nodes"})
 		return nil
 	}
 	stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: pressure on some nodes"})
-	noPressureNodeMask := allNumaNodesMask &^ highPressureNodeMask &^ medPressureNodeMask
 	log.Debugf("no pressure nodes: %v\n", nodeMaskToIds(noPressureNodeMask))
-	for _, nset := range leastPressureNodesets {
-		// look for cgroups that have memory on pressure and no pressure nodes
+	cands := []*moveCandidate{}
+	for _, nset := range mostPressureNodesets {
+		// Look for cgroups that have memory on both high and no pressure nodes
 		if nset.nodeMask&highPressureNodeMask == 0 || nset.nodeMask&noPressureNodeMask == 0 || len(nset.cgroups) == 0 {
 			continue
 		}
@@ -483,46 +477,95 @@ func (p *PolicyAvoidOom) balance() error {
 		for _, cgroup := range nset.cgroups {
 			// find processes in cgroup that have memory on high pressure nodes
 			for _, pid := range cgroup.procs {
-				nodePidsize := map[int]int64{}
+				nodeAddrSize := map[int]map[uint64]int64{}
 				sizeOnPressure := int64(0)
+				pidNodeMask := NodeMask(0)
 				procNumaMaps(pid, func(addr uint64, nodePagecount map[int]int64, pagesize int64, attrs map[string]string) {
 					if _, ok := attrs["anon"]; !ok {
 						return
 					}
 					for node, pagecount := range nodePagecount {
-						if highPressureNodeMask&(1<<node) != 0 {
+						pidNodeMask |= nodeIdToMask(node)
+						if highPressureNodeMask& nodeIdToMask(node) != 0 {
 							size := pagecount * pagesize
-							nodePidsize[pid] += size
 							sizeOnPressure += size
+							if _, ok := nodeAddrSize[node]; !ok {
+								nodeAddrSize[node] = map[uint64]int64{}
+							}
+							nodeSize[node][addr] = size
 						}
 					}
 				})
-				if oomScore, err := procReadInt(fmt.Sprintf("/proc/%d/oom_score", pid)); err == nil {
-					log.Debugf("  pid: %d oom_score: %d sizeOnPressure: %d\n", pid, oomScore, sizeOnPressure)
-					score := ((10000+int64(oomScore))*sizeOnPressure)/10000
-					pidCgroup[pid] = cgroup
-					scorePid[score] = pid
-					scores = append(scores, score)
+				if sizeOnPressure < constMinimumPidMoveSize {
+					continue
 				}
+				oomScore, err := procReadInt(fmt.Sprintf("/proc/%d/oom_score", pid))
+				if err != nil {
+					continue
+				}
+				for node, addrSize := range nodeAddrSize {
+					for addr, size := range addrSize {
+						cand := &moveCandidate{
+							pid:      pid,
+							cgroup:   cgroup,
+							addr:     addr,
+							size:     size,
+							fromNode: node,
+							preferredTargetMasks: []NodeMask{
+								pidNodeMask & noPressureNodeMask,
+								nset.nodeMask & noPressureNodeMask,
+								pidNodeMask & (noPressureNodeMask | medPressureNodeMask),
+								nset.nodeMask & (noPressureNodeMask | medPressureNodeMask)},
+							score: size * (10000 + int64(oomScore)) / 10000,
+						}
+						cands = append(cands, cand)
+					}
+				}
+				log.Debugf("  pid: %d oom_score: %d sizeOnPressure: %d\n", pid, oomScore, sizeOnPressure)
 			}
 		}
-		if len(scores) == 0 {
+		if len(cands) == 0 {
 			continue
 		}
-		sort.Slice(scores, func(i, j int) bool {
-			return scores[i] > scores[j]
+		sort.Slice(cands, func(i, j int) bool {
+			return cands[i] > cands[j]
 		})
-		for _, score := range scores {
-			pid := scorePid[score]
-			cgroup := pidCgroup[pid]
-			targetNodeMask := cgroup.nodeset.nodeMask & noPressureNodeMask
-			log.Debugf("move candidate score %d: pid=%d targets=%b\n", score, scorePid[score], targetNodeMask)
-			targetNodes := []int{}
-			for _, nodeId := range allNumaNodes {
-				if targetNodeMask&(1<<nodeId) != 0 {
-					targetNodes = append(targetNodes, nodeId)
+		targetMove := map[int]int64{}
+		bytesToMoveFromNode := map[int]int64{}
+		for _, node := range nodeMaskToIds(highPressureNodeMask) {
+			bytesToMoveFromNode[node] = p.nodes[node].memAvail - p.nodes[node].stopFreeingMemory
+		}
+		bytesAvailOnNode := map[int]int64{}
+		for _, node := range nodeMaskToIds(noPressureNodeMask) {
+			bytesAvailOnNode[node] = p.nodes[node].memAvail - p.nodes[node].stopFreeingMemory
+		}
+		p.prevCands = cands
+		for _, cand := range cands {
+			pid := cand.pid
+			cgroup := cand.cgroup
+			targetNodeMask := NodeMask(0)
+			// find a preferred target node that has most memory available
+			for _, targetMask := range cand.preferredTargetMasks {
+				if targetMask == 0 {
+					continue
+				}
+				for _, targetNode := range nodeMaskToIds(targetMask) {
+					if bytesAvailOnNode[targetNode] >= cand.size {
+						targetNodeMask = nodeIdToMask(targetNode)
+						break
+					}
+				}
+				if targetNodeMask != 0 {
+					break
 				}
 			}
+			if targetNodeMask == 0 {
+				// Cannot fit pages of this memory segment on any target node.
+				// Currently we do not try to split the memory segment.
+				continue
+			}
+			log.Debugf("move candidate score %d: pid=%d targets=%b\n", score, scorePid[score], targetNodeMask)
+			targetNodes := nodeMaskToIds(targetNodeMask)
 			// sort targetNodes by memory available
 			sort.Slice(targetNodes, func(i, j int) bool {
 				return p.nodes[targetNodes[i]].memAvail > p.nodes[targetNodes[j]].memAvail
@@ -532,7 +575,8 @@ func (p *PolicyAvoidOom) balance() error {
 			}
 			// move pid to targetNodes[0]
 			if len(targetNodes) > 0 {
-				log.Debugf("move pid %d to node %d\n", pid, targetNodes[0])
+				log.Debugf("move pid %d addr %x from %d to node %d\n", pid, cand.addr, cand.fromNode, targetNodes[0])
+				// TODO: how to quickly find pages from pid at addr on fromNode?
 				process := NewProcess(pid)
 				ar, err := process.AddressRanges()
 				if err != nil {
@@ -564,11 +608,40 @@ func (p *PolicyAvoidOom) balance() error {
 	return nil
 }
 
+func (p *PolicyAvoidOom) pressureNodesets() ([]*nodeset, NodeMask, NodeMask, NodeMask) {
+	mostPressureNodesets := make([]*nodeset, 0, len(p.nodeSets))
+	for _, nset := range p.nodeSets {
+		mostPressureNodesets = append(mostPressureNodesets, nset)
+	}
+	sort.Slice(mostPressureNodesets, func(i, j int) bool {
+		return mostPressureNodesets[i].memAvail < mostPressureNodesets[j].memAvail
+	})
+	for order, nset := range mostPressureNodesets {
+		procs := []int{}
+		for _, cgroup := range nset.cgroups {
+			procs = append(procs, cgroup.procs...)
+		}
+		log.Debugf("order %d in nodes %v: avail %.3fG/%.3fG %.1f %% cgroups: %d %v\n", order, nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.memTotal)/(1<<30), 100*float32(nset.memAvail)/float32(nset.memTotal), len(nset.cgroups), procs)
+	}
+	highPressureNodeMask := NodeMask(0)
+	medPressureNodeMask := NodeMask(0)
+	for _, nset := range mostPressureNodesets {
+		if nset.memAvail < nset.startFreeingMemory {
+			log.Debugf("high pressure on nodes %v, avail: %.3fG startFreeing: %.3fG\n", nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.startFreeingMemory)/(1<<30))
+			highPressureNodeMask |= nset.nodeMask
+		} else if nset.memAvail < nset.stopFreeingMemory {
+			log.Debugf("med pressure on nodes %v, avail: %.3fG stopFreeing: %.3fG\n", nset.NodeIds(), float32(nset.memAvail)/(1<<30), float32(nset.stopFreeingMemory)/(1<<30))
+			medPressureNodeMask |= nset.nodeMask
+		}
+	}
+	return mostPressureNodesets, highPressureNodeMask, medPressureNodeMask, allNumaNodesMask &^ highPressureNodeMask &^ medPressureNodeMask
+}
+
 // Dump generates a string representation of the policy based on specified arguments
 func (p *PolicyAvoidOom) Dump(args []string) string {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	dumpHelp := `dump <config|nodes|status>`
+	dumpHelp := `dump <config|nodes|status|cands>`
 	if len(args) == 0 {
 		return dumpHelp
 	}
@@ -586,6 +659,12 @@ func (p *PolicyAvoidOom) Dump(args []string) string {
 			return "offline"
 		}
 		return "online"
+	case "cands":
+		var buf strings.Builder
+		for _, cand := range p.prevCands {
+			fmt.Fprintf(&buf, "pid: %d size: %d fromNode: %d score: %d\n", cand.pid, cand.size, cand.fromNode, cand.score)
+		}
+		return buf.String()
 	}
 	return "unknown argument, " + dumpHelp
 }
