@@ -67,7 +67,7 @@ type PolicyAvoidOomConfig struct {
 	Mover      MoverConfig
 }
 
-type NodeMask NodeMask
+type NodeMask uint64
 
 // PolicyAvoidOom defines empty struct for the scenarios without policy configured.
 type PolicyAvoidOom struct {
@@ -93,8 +93,10 @@ type memNode struct {
 type moveCandidate struct {
 	pid                  int
 	cgroup               *cgroup
-	addr                 uint64
-	size                 int64
+	addr                 uint64 // memory segment start address from numa_maps
+	pageSize             int64  // page size in bytes
+	segmentSize          int64  // total size of memory segment in bytes
+	sizeOnNode           int64  // size of memory segment on fromNode in bytes
 	fromNode             int
 	preferredTargetMasks []NodeMask
 	score                int64
@@ -349,7 +351,7 @@ func nodeIdsToMask(nodeIds []int) NodeMask {
 }
 
 func nodeIdToMask(nodeId int) NodeMask {
-	return 1<<nodeId
+	return 1 << nodeId
 }
 
 type cgroup struct {
@@ -469,30 +471,29 @@ func (p *PolicyAvoidOom) balance() error {
 		if nset.nodeMask&highPressureNodeMask == 0 || nset.nodeMask&noPressureNodeMask == 0 || len(nset.cgroups) == 0 {
 			continue
 		}
-		pidCgroup := map[int]*cgroup{}
-		scorePid := map[int64]int{}
-		scores := []int64{}
-		// TODO: when going through numa_maps, gather at the same time
-		// (high_pressure_node_mask, pid, size_on_masked_nodes, percentage_on_high_pressure_nodes)
 		for _, cgroup := range nset.cgroups {
 			// find processes in cgroup that have memory on high pressure nodes
 			for _, pid := range cgroup.procs {
 				nodeAddrSize := map[int]map[uint64]int64{}
+				addrSegmentSize := map[uint64]int64{}
+				addrPageSize := map[uint64]int64{}
 				sizeOnPressure := int64(0)
 				pidNodeMask := NodeMask(0)
 				procNumaMaps(pid, func(addr uint64, nodePagecount map[int]int64, pagesize int64, attrs map[string]string) {
 					if _, ok := attrs["anon"]; !ok {
 						return
 					}
+					addrPageSize[addr] = pagesize
 					for node, pagecount := range nodePagecount {
+						sizeOnNode := pagecount * pagesize
+						addrSegmentSize[addr] += sizeOnNode
 						pidNodeMask |= nodeIdToMask(node)
-						if highPressureNodeMask& nodeIdToMask(node) != 0 {
-							size := pagecount * pagesize
-							sizeOnPressure += size
+						if highPressureNodeMask&nodeIdToMask(node) != 0 {
+							sizeOnPressure += sizeOnNode
 							if _, ok := nodeAddrSize[node]; !ok {
 								nodeAddrSize[node] = map[uint64]int64{}
 							}
-							nodeSize[node][addr] = size
+							nodeAddrSize[node][addr] += sizeOnNode
 						}
 					}
 				})
@@ -506,11 +507,13 @@ func (p *PolicyAvoidOom) balance() error {
 				for node, addrSize := range nodeAddrSize {
 					for addr, size := range addrSize {
 						cand := &moveCandidate{
-							pid:      pid,
-							cgroup:   cgroup,
-							addr:     addr,
-							size:     size,
-							fromNode: node,
+							pid:         pid,
+							cgroup:      cgroup,
+							addr:        addr,
+							pageSize:    addrPageSize[addr],
+							segmentSize: addrSegmentSize[addr],
+							sizeOnNode:  size,
+							fromNode:    node,
 							preferredTargetMasks: []NodeMask{
 								pidNodeMask & noPressureNodeMask,
 								nset.nodeMask & noPressureNodeMask,
@@ -528,12 +531,11 @@ func (p *PolicyAvoidOom) balance() error {
 			continue
 		}
 		sort.Slice(cands, func(i, j int) bool {
-			return cands[i] > cands[j]
+			return cands[i].score > cands[j].score
 		})
-		targetMove := map[int]int64{}
 		bytesToMoveFromNode := map[int]int64{}
 		for _, node := range nodeMaskToIds(highPressureNodeMask) {
-			bytesToMoveFromNode[node] = p.nodes[node].memAvail - p.nodes[node].stopFreeingMemory
+			bytesToMoveFromNode[node] = p.nodes[node].stopFreeingMemory - p.nodes[node].memAvail
 		}
 		bytesAvailOnNode := map[int]int64{}
 		for _, node := range nodeMaskToIds(noPressureNodeMask) {
@@ -542,7 +544,6 @@ func (p *PolicyAvoidOom) balance() error {
 		p.prevCands = cands
 		for _, cand := range cands {
 			pid := cand.pid
-			cgroup := cand.cgroup
 			targetNodeMask := NodeMask(0)
 			// find a preferred target node that has most memory available
 			for _, targetMask := range cand.preferredTargetMasks {
@@ -550,7 +551,7 @@ func (p *PolicyAvoidOom) balance() error {
 					continue
 				}
 				for _, targetNode := range nodeMaskToIds(targetMask) {
-					if bytesAvailOnNode[targetNode] >= cand.size {
+					if bytesAvailOnNode[targetNode] >= cand.sizeOnNode {
 						targetNodeMask = nodeIdToMask(targetNode)
 						break
 					}
@@ -562,9 +563,10 @@ func (p *PolicyAvoidOom) balance() error {
 			if targetNodeMask == 0 {
 				// Cannot fit pages of this memory segment on any target node.
 				// Currently we do not try to split the memory segment.
+				// Continue to look smaller segments in next candidates.
 				continue
 			}
-			log.Debugf("move candidate score %d: pid=%d targets=%b\n", score, scorePid[score], targetNodeMask)
+			log.Debugf("move candidate score %d: pid=%d targets=%b\n", cand.score, cand.pid, targetNodeMask)
 			targetNodes := nodeMaskToIds(targetNodeMask)
 			// sort targetNodes by memory available
 			sort.Slice(targetNodes, func(i, j int) bool {
@@ -573,36 +575,61 @@ func (p *PolicyAvoidOom) balance() error {
 			for _, nodeId := range targetNodes {
 				log.Debugf("- target node %d avail %.3fG/%.3fG %.1f %%\n", nodeId, float32(p.nodes[nodeId].memAvail)/(1<<30), float32(p.nodes[nodeId].memTotal)/(1<<30), 100*float32(p.nodes[nodeId].memAvail)/float32(p.nodes[nodeId].memTotal))
 			}
-			// move pid to targetNodes[0]
-			if len(targetNodes) > 0 {
-				log.Debugf("move pid %d addr %x from %d to node %d\n", pid, cand.addr, cand.fromNode, targetNodes[0])
-				// TODO: how to quickly find pages from pid at addr on fromNode?
-				process := NewProcess(pid)
-				ar, err := process.AddressRanges()
-				if err != nil {
-					continue
-				}
-				// TODO: filter address ranges that do
-				// not include pages from pressure
-				// nodes.  Consider raw filtering
-				// (fewest syscalls): select address
-				// ranges from numa_maps so that after
-				// moving the total number of pages in
-				// high pressure nodes exceeds
-				// "stopFreeingMemory" watermark, if
-				// possible.  Individual pages
-				// statuses from all process memory
-				// might not be needed at all.
-				pp, err := ar.PagesMatching(PMPresentSet | PMExclusiveSet)
-				if err != nil {
-					continue
-				}
-				//pp = pp.OnNodes(highPressureNodeMask)
-				if pp == nil {
-					continue
-				}
-				p.mover.AddTask(NewMoverTask(pp, Node(targetNodes[0])))
+
+			log.Debugf("move pid %d addr %x from %d to node %d\n", pid, cand.addr, cand.fromNode, targetNodes[0])
+			// Now we have a candidate to move.
+			// As we calculated total memory segment size from numa_maps,
+			// we can skip scanning /proc/pid/maps for start/end addresses.
+			// In other words, no need to go through
+			// NewProcess().AddressRanges().PagesMatching(),
+			// but we can create Pages object directly.
+			pp := &Pages{
+				pid: pid,
+				pages: make([]Page, 0, cand.segmentSize/cand.pageSize),
 			}
+			for addr := cand.addr; addr < cand.addr + uint64(cand.segmentSize); addr += uint64(cand.pageSize) {
+				pp.pages = append(pp.pages, Page{addr: addr})
+			}
+			pageLocations, err := pp.status()
+			if err != nil {
+				log.Debugf("failed to get page status for pid %d %x-%x (%d pages): %v", pid, cand.addr, cand.addr+uint64(cand.segmentSize), cand.segmentSize / cand.pageSize, err)
+				continue
+			}
+			pagesOnHPNodes := &Pages{pid: pid, pages: make([]Page, 0)}
+			for pageIndex, node := range pageLocations {
+				if node < 0 {
+					// error reading page location
+					continue
+				}
+				if highPressureNodeMask&(1<<node) != 0 && bytesToMoveFromNode[node] > 0 {
+					pagesOnHPNodes.pages = append(pagesOnHPNodes.pages, pp.pages[pageIndex])
+					bytesToMoveFromNode[node] -= cand.pageSize
+					bytesAvailOnNode[targetNodes[0]] -= cand.pageSize
+				}
+			}
+			if len(pagesOnHPNodes.pages) == 0 {
+				log.Debugf("no pages to move from pid %d %x-%x to node %d\n", pid, cand.addr, cand.addr+uint64(cand.segmentSize), targetNodes[0])
+				continue
+			}
+			log.Debugf("schedule move task of %d MB (%d pages) of pid %d memory to node %d",
+				(int64(len(pagesOnHPNodes.pages)) * cand.pageSize) >> 20,
+				len(pagesOnHPNodes.pages),
+				pid,
+				targetNodes[0])
+			p.mover.AddTask(NewMoverTask(pagesOnHPNodes, Node(targetNodes[0])))
+
+			// Calculate if we have still need to move memory from any node
+			bytesToMove := int64(0)
+			for _, node := range nodeMaskToIds(highPressureNodeMask) {
+				if bytesToMoveFromNode[node] > 0 {
+					bytesToMove += bytesToMoveFromNode[node]
+				}
+			}
+			if bytesToMove == 0 {
+				log.Debugf("move tasks created for all necessary data from high pressure nodes")
+				break
+			}
+			log.Debugf("still need to find %d MB to move from high pressure nodes", bytesToMove >> 20)
 		}
 	}
 	return nil
@@ -662,7 +689,13 @@ func (p *PolicyAvoidOom) Dump(args []string) string {
 	case "cands":
 		var buf strings.Builder
 		for _, cand := range p.prevCands {
-			fmt.Fprintf(&buf, "pid: %d size: %d fromNode: %d score: %d\n", cand.pid, cand.size, cand.fromNode, cand.score)
+			fmt.Fprintf(&buf, "pid: %d %x size: %d MB (in %d kB pages) fromNode: %d score: %d\n",
+				cand.pid,
+				cand.addr,
+				cand.sizeOnNode >> 20,
+				cand.pageSize / 1024,
+				cand.fromNode,
+				cand.score)
 		}
 		return buf.String()
 	}
