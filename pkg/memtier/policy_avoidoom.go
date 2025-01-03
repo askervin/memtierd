@@ -71,14 +71,15 @@ type NodeMask uint64
 
 // PolicyAvoidOom defines empty struct for the scenarios without policy configured.
 type PolicyAvoidOom struct {
-	config    *PolicyAvoidOomConfig
-	nodes     []*memNode
-	nodeSets  map[NodeMask]*nodeset
-	cgroups   []*cgroup
-	prevCands []*moveCandidate
-	mover     *Mover
-	cmdLoop   chan chan interface{}
-	mutex     sync.Mutex
+	config      *PolicyAvoidOomConfig
+	nodes       []*memNode
+	nodeSets    map[NodeMask]*nodeset
+	cgroups     []*cgroup
+	prevCands   []*moveCandidate
+	mover       *Mover
+	cmdLoop     chan chan interface{}
+	mutex       sync.Mutex
+	lastBalance string
 }
 
 type memNode struct {
@@ -444,27 +445,27 @@ func (p *PolicyAvoidOom) loop(cmd chan chan interface{}) {
 	}
 }
 
+func (p *PolicyAvoidOom) setBalanceStatus(status string) error {
+	p.lastBalance = status
+	stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: " + p.lastBalance})
+	return nil
+}
+
 func (p *PolicyAvoidOom) balance() error {
 	if p.mover.TaskCount() > 0 {
-		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: mover busy"})
-		log.Debugf("PolicyAvoidOom.balance: mover busy\n")
-		return nil
+		return p.setBalanceStatus("mover busy")
 	}
 	mostPressureNodesets, highPressureNodeMask, medPressureNodeMask, noPressureNodeMask := p.pressureNodesets()
 	if highPressureNodeMask == 0 {
-		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: no pressure"})
-		return nil
+		return p.setBalanceStatus("no pressure")
 	}
 	if highPressureNodeMask == allNumaNodesMask {
-		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: high pressure on all nodes"})
-		return nil
+		return p.setBalanceStatus("high pressure on all nodes")
 	}
 	if noPressureNodeMask == 0 {
-		stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: no low pressure nodes"})
-		return nil
+		return p.setBalanceStatus("no low pressure nodes")
 	}
-	stats.Store(StatsHeartbeat{"PolicyAvoidOom.balance: pressure on some nodes"})
-	log.Debugf("no pressure nodes: %v\n", nodeMaskToIds(noPressureNodeMask))
+	p.setBalanceStatus("pressure on some nodes")
 	cands := []*moveCandidate{}
 	for _, nset := range mostPressureNodesets {
 		// Look for cgroups that have memory on both high and no pressure nodes
@@ -584,15 +585,15 @@ func (p *PolicyAvoidOom) balance() error {
 			// NewProcess().AddressRanges().PagesMatching(),
 			// but we can create Pages object directly.
 			pp := &Pages{
-				pid: pid,
+				pid:   pid,
 				pages: make([]Page, 0, cand.segmentSize/cand.pageSize),
 			}
-			for addr := cand.addr; addr < cand.addr + uint64(cand.segmentSize); addr += uint64(cand.pageSize) {
+			for addr := cand.addr; addr < cand.addr+uint64(cand.segmentSize); addr += uint64(cand.pageSize) {
 				pp.pages = append(pp.pages, Page{addr: addr})
 			}
 			pageLocations, err := pp.status()
 			if err != nil {
-				log.Debugf("failed to get page status for pid %d %x-%x (%d pages): %v", pid, cand.addr, cand.addr+uint64(cand.segmentSize), cand.segmentSize / cand.pageSize, err)
+				log.Debugf("failed to get page status for pid %d %x-%x (%d pages): %v", pid, cand.addr, cand.addr+uint64(cand.segmentSize), cand.segmentSize/cand.pageSize, err)
 				continue
 			}
 			pagesOnHPNodes := &Pages{pid: pid, pages: make([]Page, 0)}
@@ -612,7 +613,7 @@ func (p *PolicyAvoidOom) balance() error {
 				continue
 			}
 			log.Debugf("schedule move task of %d MB (%d pages) of pid %d memory to node %d",
-				(int64(len(pagesOnHPNodes.pages)) * cand.pageSize) >> 20,
+				(int64(len(pagesOnHPNodes.pages))*cand.pageSize)>>20,
 				len(pagesOnHPNodes.pages),
 				pid,
 				targetNodes[0])
@@ -629,7 +630,7 @@ func (p *PolicyAvoidOom) balance() error {
 				log.Debugf("move tasks created for all necessary data from high pressure nodes")
 				break
 			}
-			log.Debugf("still need to find %d MB to move from high pressure nodes", bytesToMove >> 20)
+			log.Debugf("still need to find %d MB to move from high pressure nodes", bytesToMove>>20)
 		}
 	}
 	return nil
@@ -668,7 +669,7 @@ func (p *PolicyAvoidOom) pressureNodesets() ([]*nodeset, NodeMask, NodeMask, Nod
 func (p *PolicyAvoidOom) Dump(args []string) string {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	dumpHelp := `dump <config|nodes|status|cands>`
+	dumpHelp := `dump <config|nodes|status|balance|cands>`
 	if len(args) == 0 {
 		return dumpHelp
 	}
@@ -686,14 +687,16 @@ func (p *PolicyAvoidOom) Dump(args []string) string {
 			return "offline"
 		}
 		return "online"
+	case "balance":
+		return p.lastBalance
 	case "cands":
 		var buf strings.Builder
 		for _, cand := range p.prevCands {
 			fmt.Fprintf(&buf, "pid: %d %x size: %d MB (in %d kB pages) fromNode: %d score: %d\n",
 				cand.pid,
 				cand.addr,
-				cand.sizeOnNode >> 20,
-				cand.pageSize / 1024,
+				cand.sizeOnNode>>20,
+				cand.pageSize/1024,
 				cand.fromNode,
 				cand.score)
 		}
