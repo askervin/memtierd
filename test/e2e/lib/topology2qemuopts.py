@@ -207,7 +207,7 @@ def dists(numalist):
     return dist_dict
 
 def qemuopts(numalist):
-    machineparam = "-machine pc"
+    machineparam = "-machine q35"
     numaparams = []
     objectparams = []
     deviceparams = []
@@ -313,7 +313,8 @@ def qemuopts(numalist):
                     if cpucount > 0:
                         if not currentnumaparams:
                             currentnumaparams.append("-numa node,nodeid=%s" % (lastnode,))
-                        currentnumaparams[-1] = currentnumaparams[-1] + (",cpus=%s-%s" % (lastcpu + 1, lastcpu + cpucount))
+#                        currentnumaparams[-1] = currentnumaparams[-1] + (",cpus=%s-%s" % (lastcpu + 1, lastcpu + cpucount))
+                        currentnumaparams[-1] = currentnumaparams[-1] + (",cpus=%s-2047" % (lastcpu + 1,))
                         lastcpu += cpucount
                     numaparams.extend(currentnumaparams)
     node_node_dist = dists(numalist)
@@ -331,7 +332,8 @@ def qemuopts(numalist):
         # Don't give dies parameter unless it is absolutely necessary
         # because it requires Qemu >= 5.0.
         diesparam = ""
-    cpuparam = "-smp cpus=%s,threads=%s%s,sockets=%s" % (lastcpu + 1, threadcount, diesparam, lastsocket + 1)
+    maxcpusparam = ",maxcpus=2048"
+    cpuparam = "-smp cpus=%s,threads=%s%s,sockets=%s%s" % (lastcpu + 1, threadcount, diesparam, lastsocket + 1, maxcpusparam)
     maxmem = siadd(totalmem, totalnvmem)
     startmem = sisub(sisub(maxmem, unpluggedmem), pluggedmem)
     memparam = "-m size=%s,slots=%s,maxmem=%s" % (startmem, memslots, maxmem)
