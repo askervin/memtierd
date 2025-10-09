@@ -24,7 +24,7 @@ NUMA node group definitions:
                       The default is 1.
 "packages"            number of packages.
                       The default is 1.
-"cpus-present"        number of logical CPUs that are present at startup.
+"cpus-present"        number of logical CPUs present in the system.
                       The default value 0 means "all".
 
 NUMA node distances are defined with following keys:
@@ -323,7 +323,7 @@ def qemuopts(numalist):
                         currentnumaparams[-1] = currentnumaparams[-1] + (",cpus=%s-%s" % (lastcpu + 1, lastcpu + cpucount))
                         lastcpu += cpucount
                         if cpuspresentcount > 0:
-                            lastcpupresent += cpuspresentcount
+                            lastcpupresent = cpuspresentcount - 1
                         else:
                             lastcpupresent += cpucount
                     numaparams.extend(currentnumaparams)
