@@ -102,7 +102,7 @@ usage() {
     echo "             Supported values: centos-7, centos-8, debian-10, debian-sid"
     echo "                 fedora, fedora-33, opensuse-tumbleweed,"
     echo "                 opensuse-15.4 (same as opensuse), sles,"
-    echo "                 ubuntu-18.04, ubuntu-20.04, ubuntu-22.04"
+    echo "                 ubuntu, ubuntu-22.04, ubuntu-24.04"
     echo "             If sles: set VM_SLES_REGCODE=<CODE> to use official packages."
     echo "    cgroups: cgroups version in the VM, v1 or v2. The default is v1."
     echo "             cgroups=v2 is supported only on distro=fedora"
@@ -301,7 +301,7 @@ cpu_ids = lambda i: set_ids(i, '[cpu]')
 
 get-py-cache() {
     # Fetch current cri-resmgr cache from a virtual machine.
-    speed=1000 vm-command "cat \"/var/lib/cri-resmgr/cache\"" >/dev/null 2>&1 || {
+    speed=1000 vm-command "cat \"/var/lib/nri-resource-policy/cache\"" >/dev/null 2>&1 || {
         command-error "fetching cache file failed"
     }
     cat >"${OUTPUT_DIR}/cache" <<<"$COMMAND_OUTPUT"

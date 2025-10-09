@@ -23,5 +23,20 @@ spec:
       - sh
       - -c
       - echo ${NAME}c$(( contnum - 1 )) \$(sleep inf)
+    $(if [ -n "${CPUREQ}" ]; then echo "
+    resources:
+      requests:
+        cpu: ${CPUREQ}
+        $(if [ -n "${MEMREQ}" ]; then echo "
+        memory: '${MEMREQ}'
+        "; fi)
+      $(if [ -n "${CPULIM}" ]; then echo "
+      limits:
+        cpu: ${CPULIM}
+        $(if [ -n "$MEMLIM" ]; then echo "
+        memory: '${MEMLIM}'
+        "; fi)
+      "; fi)
+    "; fi)
   "; done )
   terminationGracePeriodSeconds: 1

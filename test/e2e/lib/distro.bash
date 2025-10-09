@@ -118,6 +118,10 @@ distro-unresolved() {
 # Ubuntu 18.04, 20.04, 22.04, 24.04, Debian 10, generic debian
 #
 
+ubuntu-image-url() {
+    ubuntu-24_04-image-url
+}
+
 ubuntu-18_04-image-url() {
     echo "https://cloud-images.ubuntu.com/bionic/current/bionic-server-cloudimg-amd64.img"
 }
@@ -289,7 +293,7 @@ debian-10-install-containerd-pre() {
 
 }
 
-debian-sid-install-containerd-post() {
+debian-sid-config-containerd-post() {
     vm-command "sed -e 's|bin_dir = \"/usr/lib/cni\"|bin_dir = \"/opt/cni/bin\"|g' -i /etc/containerd/config.toml"
 }
 

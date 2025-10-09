@@ -940,14 +940,21 @@ vm-install-cri() {
     fi
 }
 
-vm-install-nri-plugin() {
-    local plugin="$1"
-    local namespace_args="-n kube-system"
-    vm-command "(helm repo ls | grep nri-plugins ) || helm repo add nri-plugins https://containers.github.io/nri-plugins" || {
-        command-error "installing nri-plugins helm repo failed"
+vm-install-helm-pkg() { # script API
+    # Usage: vm-install-helm-pkg REPO/PACKAGE [extra-helm-install-args...]
+    local helm_repo="${1%%/*}"
+    local helm_pkg="${1#*/}"
+    local helm_repo_url="https://containers.github.io/$helm_repo"
+    shift
+    if [ -z "$helm_repo" ] || [ -z "$helm_pkg" ]; then
+        error "vm-install-helm-pkg: invalid REPO/PACKAGE \"$1\""
+        return 1
+    fi
+    vm-command "(helm repo ls | grep -q $helm_repo ) || helm repo add $helm_repo $helm_repo_url" || {
+        command-error "adding helm repo $helm_repo in $helm_repo_url failed"
     }
-    vm-command "helm install $plugin nri-plugins/$plugin --set nri.patchRuntimeConfig=true $namespace_args" || {
-        command-error "installing nri-plugins/$plugin failed"
+    vm-command "helm install $helm_pkg $helm_repo/$helm_pkg $*" || {
+        command-error "installing helm package $helm_repo/$helm_pkg failed"
     }
 }
 
@@ -1145,7 +1152,7 @@ memorySwap:
 EOF
         kubeadm_opts="--config kubeadm-initconfig.yaml"
     else
-        kubeadm_opts="--pod-network-cidr=$CNI_SUBNET --cri-socket ${k8scri_sock}"
+        kubeadm_opts="--pod-network-cidr=$CNI_SUBNET --cri-socket unix://${k8scri_sock}"
     fi
     vm-command "kubeadm init $kubeadm_opts"
     if ! grep -q "initialized successfully" <<<"$COMMAND_OUTPUT"; then
