@@ -36,6 +36,7 @@ config:
       - cache
       - policy
       - nri-plugin
+      - sysfs
     source: true
     klog:
       skip_headers: true

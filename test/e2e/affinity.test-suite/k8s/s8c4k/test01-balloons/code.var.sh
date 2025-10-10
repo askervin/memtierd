@@ -20,6 +20,20 @@ vm-command 'for cpuX in /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*; do
 done
 grep . /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*/online'
 
+# Sometimes the kernel (seen at least Debian Linux 6.16.9) does not
+# expose cpuX/topology directory but situation may improve by
+# offlininging and re-onlining the CPU.
+vm-command 'recheck=1; while [ $recheck == "1" ]; do
+    recheck=0
+    for cpuX in /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*; do
+        [ -d $cpuX/topology ] || {
+            echo "cannot find $cpuX/topology, offline-online the CPU"
+            echo 0 > $cpuX/online; sleep 0.1; echo 1 > $cpuX/online
+            recheck=1
+        }
+    done
+done'
+
 if ! vm-command "type -p kubelet"; then
     vm-install-k8s
 fi
