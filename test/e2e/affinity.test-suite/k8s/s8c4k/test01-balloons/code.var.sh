@@ -55,7 +55,7 @@ vm-put-file $(instantiate balloons.conf) balloons.conf
 if vm-command "helm ls | grep nri-resource-policy-balloons"; then
     vm-command "helm uninstall nri-resource-policy-balloons"
 fi
-vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf --set patchRuntimeConfig=true
+vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf --set nri.runtime.patchConfig=true
 
 CPUREQ="500m" CPULIM="" MEMREQ=50M MEMLIM=""
 ANN0="balloon.balloons.resource-policy.nri.io/container.pod0c0: pkg0"
