@@ -1035,6 +1035,10 @@ echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.d/k8s.conf
 echo "net.ipv4.conf.*.rp_filter = 0" >> /etc/sysctl.d/k8s.conf
 
 /sbin/sysctl -p /etc/sysctl.d/k8s.conf || :
+
+# workaround systemd bug that garbles non-ANSI termian output
+rm -f /etc/profile.d/80-systemd-osc-context.sh
+rm -f /usr/lib/systemd/profile.d/80-systemd-osc-context.sh
 EOF
 }
 
