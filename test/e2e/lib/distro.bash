@@ -204,6 +204,12 @@ debian-pkg-type() {
     echo deb
 }
 
+debian-setup-proxies-post() {
+    if [ -n "$apt_proxy" ]; then
+        vm-command "mkdir -p /etc/apt/apt.conf.d; echo 'Acquire::http::Proxy \"$apt_proxy\";' > /etc/apt/apt.conf.d/00proxy; sed -e 's|https:|http:|g' -i \$(find /etc/apt -type f)"
+    fi
+}
+
 debian-install-repo-key() {
     local key
     # apt-key needs gnupg2, that might not be available by default
@@ -474,6 +480,12 @@ fedora-33-image-url() {
 
 fedora-ssh-user() {
     echo fedora
+}
+
+fedora-setup-proxies-post() {
+    if [ -n "$dnf_proxy" ]; then
+        vm-command "echo proxy=$dnf_proxy >> /etc/dnf/dnf.conf; sed -e 's|https:|http:|g' -i /etc/yum.repos.d/*"
+    fi
 }
 
 fedora-install-utils() {
@@ -1156,6 +1168,46 @@ default-config-containerd() {
     fi
 
     vm-sed-file /etc/containerd/config.toml 's/SystemdCgroup = false/SystemdCgroup = true/g'
+
+    if [ -n "$registry_mirrors" ]; then
+        vm-command "containerd --version"
+        if [[ "$COMMAND_OUTPUT" == *"containerd/v2"* ]]; then
+            # setup container image registry mirrors to containerd v2
+
+            vm-command "HOST_IP=172.17.0.1
+            CONTAINERD_CERTSD=/etc/containerd/certs.d
+            port=5000
+            for registry in registry-1.docker.io quay.io registry.k8s.io; do
+                mkdir -p \$CONTAINERD_CERTSD/\$registry
+                cat  > \$CONTAINERD_CERTSD/\$registry/hosts.toml <<EOF
+server=\"https://\$registry\"
+[host.\"http://\${HOST_IP}:\$port\"]
+  capabilities = [\"pull\", \"resolve\"]
+EOF
+                port=\$(( port + 1 ))
+            done
+            mkdir -p /etc/containerd/config.d
+            cat > /etc/containerd/config.d/40-mirrors << EOF
+[plugins.\"io.containerd.grpc.v1.cri\"]
+  [plugins.\"io.containerd.grpc.v1.cri\".registry]
+    config_path = \"\$CONTAINERD_CERTSD\"
+EOF
+            "
+        else
+            # setup container image registry mirrors to containerd v1
+            cat <<EOF |
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+    endpoint = ["http://172.17.0.1:5000"]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]
+    endpoint = ["http://172.17.0.1:5001"]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
+    endpoint = ["http://172.17.0.1:5002"]
+EOF
+            vm-pipe-to-file /etc/containerd/config.d/40-mirrors
+        fi
+        vm-command 'grep -qE "imports.*config.d" /etc/containerd/config.toml || sed -i "s|imports = .*|imports = [\"/etc/containerd/config.d/*\"]|g" /etc/containerd/config.toml'
+    fi
 }
 
 default-restart-containerd() {
