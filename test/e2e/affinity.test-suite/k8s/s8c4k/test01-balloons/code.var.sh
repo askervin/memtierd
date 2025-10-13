@@ -14,18 +14,18 @@ vm-command 'grep 511,1535,4095 /sys/devices/system/cpu/enabled' || {
     vm-cpu-hotplug 7 511 0
 }
 
-vm-command 'for cpuX in /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*; do
+vm-command 'for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
     echo onlining $cpuX
     echo 1 > $cpuX/online
 done
-grep . /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*/online'
+grep . /sys/devices/system/cpu/cpu[1-9]*/online'
 
 # Sometimes the kernel (seen at least Debian Linux 6.16.9) does not
 # expose cpuX/topology directory but situation may improve by
 # offlininging and re-onlining the CPU.
 vm-command 'recheck=1; while [ $recheck == "1" ]; do
     recheck=0
-    for cpuX in /sys/devices/system/cpu/cpu[1-9][0-9][0-9]*; do
+    for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
         [ -d $cpuX/topology ] || {
             echo "cannot find $cpuX/topology, offline-online the CPU"
             echo 0 > $cpuX/online; sleep 0.1; echo 1 > $cpuX/online
@@ -33,6 +33,11 @@ vm-command 'recheck=1; while [ $recheck == "1" ]; do
         }
     done
 done'
+
+interactive
+
+k8s=1.34
+k8scri=containerd
 
 if ! vm-command "type -p kubelet"; then
     vm-install-k8s
@@ -42,21 +47,27 @@ if ! vm-command "[ -f /var/lib/kubelet/config.yaml ]"; then
     vm-create-singlenode-cluster
 fi
 
+vm-command "grep . /sys/fs/cgroup/kubepods/cpuset.cpus"
+if ! ( grep -q 511 <<< $COMMAND_OUTPUT &&
+           grep -q 1535 <<< $COMMAND_OUTPUT &&
+           grep -q 4095 <<< $COMMAND_OUTPUT ); then
+    command-error "kubepods cpuset.cpus does not include expected CPUs"
+fi
+
 if ! vm-command "type -p helm"; then
     vm-install-helm
 fi
 
 # MOVE TO: cleanup-pods()
-vm-command "helm ls | awk /nri-resource-policy/{print $\1}' | xargs -n 1 helm uninstall"
+vm-command "helm ls -n kube-system | awk '/nri-resource-policy/{print \$1}' | xargs -n 1 helm uninstall -n kube-system"
 vm-command "kubectl delete pods --all --now"
 
 vm-put-file $(instantiate balloons.conf) balloons.conf
 
-if vm-command "helm ls | grep nri-resource-policy-balloons"; then
-    vm-command "helm uninstall nri-resource-policy-balloons"
-fi
-vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf --set nri.runtime.patchConfig=true
+vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf --set nri.runtime.patchConfig=true -n kube-system
+vm-command "kubectl wait -n kube-system ds/nri-resource-policy-balloons --timeout=30s --for=jsonpath='{.status.numberAvailable}'=1"
 
+rm -f "$OUTPUT_DIR"/topology_dump.*
 CPUREQ="500m" CPULIM="" MEMREQ=50M MEMLIM=""
 ANN0="balloon.balloons.resource-policy.nri.io/container.pod0c0: pkg0"
 ANN1="balloon.balloons.resource-policy.nri.io/container.pod0c1: pkg2"
@@ -75,9 +86,11 @@ verify 'cpus["pod0c0"] == {"cpu0511","cpu0002","cpu0000"}' \
 # enabled CPUs. This prevents assigning to CPUs that are not in the
 # system.
 
-vm-command "yes | kubeadm --reset; systemctl stop $VM_CRI; systemctl disable $VM_CRI"
-
-vm-command "sed -i 's/.*default_runtime.*/default_runtime = \"crun\"/g' /etc/crio.conf"
+vm-command "yes | kubeadm reset && systemctl stop $VM_CRI && systemctl disable $VM_CRI"
+k8s=1.34
 VM_CRI=crio
 k8scri_sock="unix:/var/run/crio/crio.sock"
+distro-install-pkg cri-o$k8s
+vm-command "sed -i 's/# default_runtime = .*/default_runtime = \\"crun\\"/1' /etc/crio/crio.conf"
+vm-command "systemctl restart crio"
 vm-create-singlenode-cluster
