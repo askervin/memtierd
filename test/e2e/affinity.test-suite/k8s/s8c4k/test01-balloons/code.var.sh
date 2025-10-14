@@ -35,7 +35,7 @@ vm-command 'recheck=1; while [ $recheck == "1" ]; do
     recheck=0
     for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
         [ -d $cpuX/topology ] || {
-            echo "INTERESTING: onlined CPU without $cpuX/topology
+            echo "INTERESTING: onlined CPU without $cpuX/topology"
             exit 1
             echo "cannot find $cpuX/topology, offline-online the CPU"
             echo 0 > $cpuX/online; sleep 0.1; echo 1 > $cpuX/online
@@ -44,9 +44,7 @@ vm-command 'recheck=1; while [ $recheck == "1" ]; do
     done
 done' || command-error 'continue debugging manually'
 
-interactive
-
-k8s=1.34
+k8s_version=1.34
 k8scri=containerd
 
 if ! vm-command "type -p kubelet"; then
@@ -99,8 +97,10 @@ verify 'cpus["pod0c0"] == {"cpu0511","cpu0002","cpu0000"}' \
 vm-command "yes | kubeadm reset && systemctl stop $VM_CRI && systemctl disable $VM_CRI"
 k8s=1.34
 VM_CRI=crio
-k8scri_sock="unix:/var/run/crio/crio.sock"
+k8scri_sock="/var/run/crio/crio.sock"
 distro-install-pkg cri-o$k8s
 vm-command "sed -i 's/# default_runtime = .*/default_runtime = \\"crun\\"/1' /etc/crio/crio.conf"
 vm-command "systemctl restart crio"
+# Wait for crio to respond before running kubeadm
+vm-run-until "crictl -r unix:///var/run/crio/crio.sock ps"
 vm-create-singlenode-cluster
