@@ -4,10 +4,6 @@ if [ "$( ( echo $min_kernel_version; echo $COMMAND_OUTPUT ) | sort --version-sor
     error "quest OS runs too old kernel, hot-plugged CPU node topology may not work. Required: $min_kernel_version"
 fi
 
-if [ -z "$k8s" ]; then
-    error "k8s required, run with environment variable k8s=latest"
-fi
-
 # Hot-plug CPUs.
 vm-command 'grep 511,1535,4095 /sys/devices/system/cpu/enabled' || {
     vm-cpu-hotplug 0 511 0
@@ -44,48 +40,102 @@ vm-command 'recheck=1; while [ $recheck == "1" ]; do
     done
 done' || command-error 'continue debugging manually'
 
-k8s_version=1.34
-k8scri=containerd
+switch-k8s-containerd-runc() {
+    vm-command "yes | kubeadm reset && systemctl stop $VM_CRI && systemctl disable $VM_CRI"
 
-if ! vm-command "type -p kubelet"; then
-    vm-install-k8s
-fi
+    k8s_version=1.34
+    VM_CRI=containerd
+    k8scri=containerd
+    k8scri_sock="/var/run/containerd/containerd.sock"
 
-if ! vm-command "[ -f /var/lib/kubelet/config.yaml ]"; then
+    vm-command 'command -v runc.disabled-by-e2e && mv $(command -v runc.disabled-by-e2e) /usr/bin/runc'
+    vm-command 'command -v crun && mv $(command -v crun) $(command -v crun).disabled-by-e2e'
+
+    vm-command 'command -v containerd' || vm-install-cri
+    vm-command 'systemctl enable containerd; systemctl start containerd'
+
+    if ! vm-command "type -p kubelet"; then
+        vm-install-k8s
+    fi
+
+    if ! vm-command "[ -f /var/lib/kubelet/config.yaml ]"; then
+        vm-create-singlenode-cluster
+    fi
+}
+
+switch-k8s-crio-crun() {
+    vm-command "yes | kubeadm reset && systemctl stop $VM_CRI && systemctl disable $VM_CRI"
+
+    k8s_version=1.34
+    VM_CRI=crio
+    k8scri=crio
+    k8scri_sock="/var/run/crio/crio.sock"
+
+    vm-command 'command -v crun.disabled-by-e2e && mv $(command -v crun.disabled-by-e2e) /usr/bin/crun'
+    vm-command 'command -v runc && mv $(command -v runc) $(command -v runc).disabled-by-e2e'
+
+    vm-command 'command -v crio' || vm-install-cri
+    vm-command "sed -i 's/# default_runtime = .*/default_runtime = \\\"crun\\\"/1' /etc/crio/crio.conf"
+    # Prevent using runc instead of crun by misconfig.
+    vm-command "systemctl restart crio"
+    # Wait for crio to respond before running kubeadm
+    sleep 2
+    vm-command "while ! fuser -v /var/run/crio/crio.sock; do sleep 1; done"
+
+    if ! vm-command "type -p kubelet"; then
+        vm-install-k8s
+    fi
+
     vm-create-singlenode-cluster
-fi
+}
 
-vm-command "grep . /sys/fs/cgroup/kubepods/cpuset.cpus"
-if ! ( grep -q 511 <<< $COMMAND_OUTPUT &&
+test-balloons() {
+    # containerd:  kubepods/cpuset.cpus
+    # cri-o: kubepods.slice/cpuset.cpus
+    vm-command "grep . /sys/fs/cgroup/kubepods*/cpuset.cpus"
+    if ! ( grep -q 511 <<< $COMMAND_OUTPUT &&
            grep -q 1535 <<< $COMMAND_OUTPUT &&
            grep -q 4095 <<< $COMMAND_OUTPUT ); then
-    command-error "kubepods cpuset.cpus does not include expected CPUs"
-fi
+        command-error "kubepods cpuset.cpus does not include expected CPUs"
+    fi
 
-if ! vm-command "type -p helm"; then
-    vm-install-helm
-fi
+    if ! vm-command "type -p helm"; then
+        vm-install-helm
+    fi
 
-# MOVE TO: cleanup-pods()
-vm-command "helm ls -n kube-system | awk '/nri-resource-policy/{print \$1}' | xargs -n 1 helm uninstall -n kube-system"
-vm-command "kubectl delete pods --all --now"
+    vm-command "helm ls -n kube-system | awk '/nri-resource-policy/{print \$1}' | xargs -n 1 helm uninstall -n kube-system"
+    vm-command "kubectl delete pods --all --now"
 
-vm-put-file $(instantiate balloons.conf) balloons.conf
+    vm-put-file $(instantiate balloons.conf) balloons.conf
 
-vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf --set nri.runtime.patchConfig=true -n kube-system
-vm-command "kubectl wait -n kube-system ds/nri-resource-policy-balloons --timeout=30s --for=jsonpath='{.status.numberAvailable}'=1"
+    local patch_config_args=""
+    if [ "$VM_CRI" == "containerd" ] && vm-command 'containerd --version | grep 1.7'; then
+        patch_config_args="--set nri.runtime.patchConfig=true"
+    fi
+    vm-install-helm-pkg nri-plugins/nri-resource-policy-balloons --values balloons.conf $patch_config_args -n kube-system
+    vm-command "kubectl wait -n kube-system ds/nri-resource-policy-balloons --timeout=120s --for=jsonpath='{.status.numberAvailable}'=1"
 
-rm -f "$OUTPUT_DIR"/topology_dump.*
-CPUREQ="500m" CPULIM="" MEMREQ=50M MEMLIM=""
-ANN0="balloon.balloons.resource-policy.nri.io/container.pod0c0: pkg0"
-ANN1="balloon.balloons.resource-policy.nri.io/container.pod0c1: pkg2"
-ANN2="balloon.balloons.resource-policy.nri.io/container.pod0c2: pkg7"
-CONTCOUNT=3 create besteffort
-report allowed
-verify 'cpus["pod0c0"] == {"cpu0511","cpu0002","cpu0000"}' \
-       'cpus["pod0c1"] == {"cpu1535"}' \
-       'cpus["pod0c2"] == {"cpu4095"}'
+    # keep creating pod0 every time
+    reset counters
+    rm -f "$OUTPUT_DIR"/topology_dump.*
+    CPUREQ="500m" CPULIM="" MEMREQ=50M MEMLIM=""
+    ANN0="balloon.balloons.resource-policy.nri.io/container.pod0c0: pkg0"
+    ANN1="balloon.balloons.resource-policy.nri.io/container.pod0c1: pkg2"
+    ANN2="balloon.balloons.resource-policy.nri.io/container.pod0c2: pkg7"
+    CONTCOUNT=3 create besteffort
+    report allowed
+    verify 'cpus["pod0c0"] == {"cpu0511","cpu0002","cpu0000"}' \
+           'cpus["pod0c1"] == {"cpu1535"}' \
+           'cpus["pod0c2"] == {"cpu4095"}'
+}
 
+switch-k8s-crio-crun
+
+test-balloons
+
+switch-k8s-containerd-runc
+
+test-balloons
 
 # Findings:
 #
@@ -93,14 +143,3 @@ verify 'cpus["pod0c0"] == {"cpu0511","cpu0002","cpu0000"}' \
 # of possible CPUs versus actually enabled CPUs. TODO: intersect with
 # enabled CPUs. This prevents assigning to CPUs that are not in the
 # system.
-
-vm-command "yes | kubeadm reset && systemctl stop $VM_CRI && systemctl disable $VM_CRI"
-k8s=1.34
-VM_CRI=crio
-k8scri_sock="/var/run/crio/crio.sock"
-distro-install-pkg cri-o$k8s
-vm-command "sed -i 's/# default_runtime = .*/default_runtime = \\"crun\\"/1' /etc/crio/crio.conf"
-vm-command "systemctl restart crio"
-# Wait for crio to respond before running kubeadm
-vm-run-until "crictl -r unix:///var/run/crio/crio.sock ps"
-vm-create-singlenode-cluster
