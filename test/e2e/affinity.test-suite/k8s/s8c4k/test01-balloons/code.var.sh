@@ -8,31 +8,41 @@ if [ -z "$k8s" ]; then
     error "k8s required, run with environment variable k8s=latest"
 fi
 
+# Hot-plug CPUs.
 vm-command 'grep 511,1535,4095 /sys/devices/system/cpu/enabled' || {
     vm-cpu-hotplug 0 511 0
     vm-cpu-hotplug 2 511 0
     vm-cpu-hotplug 7 511 0
-}
 
-vm-command 'for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
-    echo onlining $cpuX
-    echo 1 > $cpuX/online
-done
-grep . /sys/devices/system/cpu/cpu[1-9]*/online'
+    # Wait for the kernel to expose all hot-plugged CPUs in sysfs.
+    vm-run-until '[ -d /sys/devices/system/cpu/cpu511 ] && [ -d /sys/devices/system/cpu/cpu1535 ] && [ -d /sys/devices/system/cpu/cpu4095 ]'
+
+    # Online all CPUs.
+    vm-command 'for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
+            echo onlining $cpuX
+            ( echo 1 > $cpuX/online && echo Successful: write 1 to $cpuX/online ) || echo Failed: write 1 to $cpuX/online
+        done
+       grep . /sys/devices/system/cpu/cpu[1-9]*/online'
+}
 
 # Sometimes the kernel (seen at least Debian Linux 6.16.9) does not
 # expose cpuX/topology directory but situation may improve by
 # offlininging and re-onlining the CPU.
+# NOTE: could be a false alarm due and caused by race condition:
+# kernel had not exposed hot-plugged CPUs yet in sysfs when this
+# loop was executed for the first time.
 vm-command 'recheck=1; while [ $recheck == "1" ]; do
     recheck=0
     for cpuX in /sys/devices/system/cpu/cpu[1-9]*; do
         [ -d $cpuX/topology ] || {
+            echo "INTERESTING: onlined CPU without $cpuX/topology
+            exit 1
             echo "cannot find $cpuX/topology, offline-online the CPU"
             echo 0 > $cpuX/online; sleep 0.1; echo 1 > $cpuX/online
             recheck=1
         }
     done
-done'
+done' || command-error 'continue debugging manually'
 
 interactive
 
